@@ -17,12 +17,27 @@ function json(res, status, payload) {
   res.end(body);
 }
 
-function readJson(req, maxBytes = MAX_BODY_BYTES) {
+function readJson(req, maxBytes = MAX_BODY_BYTES, signal) {
   return new Promise((resolve, reject) => {
     let size = 0;
     let tooLarge = false;
+    let settled = false;
     const chunks = [];
-    req.on('data', chunk => {
+    const cleanup = () => {
+      req.off('data', onData);
+      req.off('end', onEnd);
+      req.off('error', onError);
+      req.off('aborted', onAborted);
+      signal?.removeEventListener('abort', onSignalAbort);
+    };
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const onData = chunk => {
       size += chunk.length;
       if (size > maxBytes) {
         tooLarge = true;
@@ -30,17 +45,30 @@ function readJson(req, maxBytes = MAX_BODY_BYTES) {
       } else if (!tooLarge) {
         chunks.push(chunk);
       }
-    });
-    req.on('end', () => {
+    };
+    const onEnd = () => {
       if (tooLarge) {
-        reject(Object.assign(new Error('request body too large'), { statusCode: 413 }));
+        finish(Object.assign(new Error('request body too large'), { statusCode: 413 }));
         return;
       }
-      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
-      catch { reject(Object.assign(new Error('invalid JSON body'), { statusCode: 400 })); }
-    });
-    req.on('error', reject);
-    req.on('aborted', () => reject(Object.assign(new Error('request body aborted'), { statusCode: 400 })));
+      try { finish(null, JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+      catch { finish(Object.assign(new Error('invalid JSON body'), { statusCode: 400 })); }
+    };
+    const onError = error => finish(error);
+    const onAborted = () => finish(Object.assign(new Error('request body aborted'), { statusCode: 400 }));
+    const onSignalAbort = () => {
+      finish(Object.assign(new Error('local inference timed out'), { statusCode: 504 }));
+      req.resume();
+    };
+    if (signal?.aborted) {
+      onSignalAbort();
+      return;
+    }
+    req.on('data', onData);
+    req.once('end', onEnd);
+    req.once('error', onError);
+    req.once('aborted', onAborted);
+    signal?.addEventListener('abort', onSignalAbort, { once: true });
   });
 }
 
@@ -126,7 +154,7 @@ function createServer(options = {}) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const body = await readJson(req, maxBodyBytes);
+      const body = await readJson(req, maxBodyBytes, controller.signal);
       if (!body || typeof body !== 'object' || Array.isArray(body)) {
         throw Object.assign(new Error('request body must be a JSON object'), { statusCode: 400 });
       }
