@@ -100,3 +100,27 @@ test('keeps the inference timeout active while reading the Ollama response body'
   assert.equal(response.status, 504);
   assert.match((await response.json()).error.message, /timed out/);
 });
+
+
+test('times out a client that stalls while uploading its JSON body', async t => {
+  const gateway = createServer({ timeoutMs: 30 });
+  const port = await listen(gateway);
+  t.after(() => gateway.close());
+  const responsePromise = new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: '127.0.0.1', port, path: '/v1/chat/completions', method: 'POST',
+      headers: { 'content-type': 'application/json', 'transfer-encoding': 'chunked' },
+    }, res => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => resolve({ status: res.statusCode, body }));
+    });
+    req.on('error', reject);
+    req.write('{"messages":[');
+    setTimeout(() => req.end('{"role":"user","content":"late"}]}'), 100);
+  });
+  const response = await responsePromise;
+  assert.equal(response.status, 504);
+  assert.match(JSON.parse(response.body).error.message, /timed out/);
+});
