@@ -1,0 +1,13 @@
+{
+  "name": "sovereign-llm-gateway",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Local-first OpenAI-compatible Ollama gateway for Hermes",
+  "scripts": {
+    "start": "node local-api.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
