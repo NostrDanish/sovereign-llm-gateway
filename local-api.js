@@ -4,12 +4,14 @@ const http = require('node:http');
 const crypto = require('node:crypto');
 
 const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || 1_048_576);
+const MAX_UPSTREAM_BYTES = Number(process.env.MAX_UPSTREAM_BYTES || 4_194_304);
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 2);
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 120_000);
 const MODEL = process.env.OLLAMA_MODEL || 'llama3.2';
 const OLLAMA_URL = (process.env.OLLAMA_URL || 'http://127.0.0.1:11434').replace(/\/$/, '');
 
 function json(res, status, payload) {
+  if (res.destroyed || res.writableEnded) return;
   const body = JSON.stringify(payload);
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(body), 'cache-control': 'no-store' });
   res.end(body);
@@ -18,22 +20,58 @@ function json(res, status, payload) {
 function readJson(req) {
   return new Promise((resolve, reject) => {
     let size = 0;
+    let tooLarge = false;
     const chunks = [];
     req.on('data', chunk => {
       size += chunk.length;
       if (size > MAX_BODY_BYTES) {
-        reject(Object.assign(new Error('request body too large'), { statusCode: 413 }));
-        req.destroy();
-        return;
+        tooLarge = true;
+        chunks.length = 0;
+      } else if (!tooLarge) {
+        chunks.push(chunk);
       }
-      chunks.push(chunk);
     });
     req.on('end', () => {
+      if (tooLarge) {
+        reject(Object.assign(new Error('request body too large'), { statusCode: 413 }));
+        return;
+      }
       try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
       catch { reject(Object.assign(new Error('invalid JSON body'), { statusCode: 400 })); }
     });
     req.on('error', reject);
+    req.on('aborted', () => reject(Object.assign(new Error('request body aborted'), { statusCode: 400 })));
   });
+}
+
+async function readUpstreamJson(response, maxBytes) {
+  const declaredLength = Number(response.headers.get('content-length'));
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    throw Object.assign(new Error('local Ollama response too large'), { statusCode: 502 });
+  }
+  if (!response.body) throw Object.assign(new Error('local Ollama returned an empty response'), { statusCode: 502 });
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxBytes) {
+        await reader.cancel();
+        throw Object.assign(new Error('local Ollama response too large'), { statusCode: 502 });
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    throw Object.assign(new Error('local Ollama returned invalid JSON'), { statusCode: 502 });
+  }
 }
 
 function authorized(req, key) {
@@ -62,6 +100,8 @@ function createServer(options = {}) {
   const apiKey = options.apiKey ?? process.env.GATEWAY_API_KEY ?? '';
   const maxConcurrent = options.maxConcurrent || MAX_CONCURRENT;
   const timeoutMs = options.timeoutMs || REQUEST_TIMEOUT_MS;
+  const maxBodyBytes = options.maxBodyBytes || MAX_BODY_BYTES;
+  const maxUpstreamBytes = options.maxUpstreamBytes || MAX_UPSTREAM_BYTES;
   let active = 0;
 
   return http.createServer(async (req, res) => {
@@ -83,8 +123,13 @@ function createServer(options = {}) {
     }
 
     active += 1;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const body = await readJson(req);
+      const body = await readJson(req, maxBodyBytes);
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        throw Object.assign(new Error('request body must be a JSON object'), { statusCode: 400 });
+      }
       if (body.stream === true) {
         return json(res, 400, { error: { message: 'streaming is not implemented by this local adapter yet; set stream=false', type: 'invalid_request_error' } });
       }
@@ -92,23 +137,17 @@ function createServer(options = {}) {
         return json(res, 400, { error: { message: 'tool calling is not implemented by this local adapter yet', type: 'invalid_request_error' } });
       }
       const messages = normalizeMessages(body.messages);
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), timeoutMs);
-      let upstream;
-      try {
-        upstream = await fetch(`${ollamaUrl}/api/chat`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ model: body.model || model, messages, stream: false }),
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timeout);
-      }
+      const requestedModel = typeof body.model === 'string' && body.model.length > 0 ? body.model : model;
+      const upstream = await fetch(`${ollamaUrl}/api/chat`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: requestedModel, messages, stream: false }),
+        signal: controller.signal,
+      });
       if (!upstream.ok) {
         return json(res, 502, { error: { message: `local Ollama returned HTTP ${upstream.status}`, type: 'upstream_error' } });
       }
-      const result = await upstream.json();
+      const result = await readUpstreamJson(upstream, maxUpstreamBytes);
       const content = result && result.message && result.message.content;
       if (typeof content !== 'string') {
         return json(res, 502, { error: { message: 'local Ollama returned an invalid chat response', type: 'upstream_error' } });
@@ -117,7 +156,7 @@ function createServer(options = {}) {
         id: `chatcmpl-${crypto.randomUUID()}`,
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
-        model: body.model || model,
+        model: requestedModel,
         choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
         usage: {
           prompt_tokens: Number(result.prompt_eval_count || 0),
@@ -126,10 +165,11 @@ function createServer(options = {}) {
         },
       });
     } catch (error) {
-      if (!res.headersSent) json(res, error.statusCode || (error.name === 'AbortError' ? 504 : 502), {
+      if (!res.headersSent && !res.destroyed) json(res, error.statusCode || (error.name === 'AbortError' ? 504 : 502), {
         error: { message: error.statusCode ? error.message : (error.name === 'AbortError' ? 'local inference timed out' : 'local inference request failed'), type: 'gateway_error' },
       });
     } finally {
+      clearTimeout(timeout);
       active -= 1;
     }
   });
@@ -148,4 +188,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { createServer, normalizeMessages, authorized };
+module.exports = { createServer, normalizeMessages, authorized, readUpstreamJson };
