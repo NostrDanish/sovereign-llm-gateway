@@ -17,14 +17,14 @@ function json(res, status, payload) {
   res.end(body);
 }
 
-function readJson(req) {
+function readJson(req, maxBytes = MAX_BODY_BYTES) {
   return new Promise((resolve, reject) => {
     let size = 0;
     let tooLarge = false;
     const chunks = [];
     req.on('data', chunk => {
       size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
+      if (size > maxBytes) {
         tooLarge = true;
         chunks.length = 0;
       } else if (!tooLarge) {
