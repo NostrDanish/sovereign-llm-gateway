@@ -67,3 +67,36 @@ test('rejects unsupported tools and streaming rather than pretending support', a
     assert.equal(response.status, 400);
   }
 });
+
+
+test('returns 413 for oversized JSON without abruptly destroying the request', async t => {
+  const gateway = createServer({ apiKey: 'secret', maxBodyBytes: 32 });
+  const port = await listen(gateway);
+  t.after(() => gateway.close());
+  const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { authorization: 'Bearer secret', 'content-type': 'application/json' },
+    body: JSON.stringify({ messages: [{ role: 'user', content: 'this request is deliberately much too large' }] }),
+  });
+  assert.equal(response.status, 413);
+  assert.match((await response.json()).error.message, /too large/);
+});
+
+test('keeps the inference timeout active while reading the Ollama response body', async t => {
+  const ollama = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.flushHeaders();
+    setTimeout(() => res.end(JSON.stringify({ message: { content: 'too late' } })), 100);
+  });
+  const ollamaPort = await listen(ollama);
+  const gateway = createServer({ ollamaUrl: `http://127.0.0.1:${ollamaPort}`, timeoutMs: 20 });
+  const gatewayPort = await listen(gateway);
+  t.after(() => { ollama.close(); gateway.close(); });
+  const response = await fetch(`http://127.0.0.1:${gatewayPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ messages: [{ role: 'user', content: 'hello' }] }),
+  });
+  assert.equal(response.status, 504);
+  assert.match((await response.json()).error.message, /timed out/);
+});
